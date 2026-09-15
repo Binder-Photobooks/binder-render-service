@@ -1,0 +1,27 @@
+# Render.com "Blueprint" — lets Render read this file and set up the service's basic
+# configuration automatically when you connect this repo. You'll still need to fill in the
+# actual secret values yourself in Render's dashboard (see README.md) — this file only
+# describes *which* environment variables the service needs, not their values, since those
+# obviously can't live in a file you might commit to a repo.
+services:
+  - type: web
+    name: binder-render-service
+    runtime: node
+    plan: free # switched from "starter" — fine to start on while render volume is low; the
+      # tradeoffs: only 512MB RAM (a very large book's render could hit this ceiling) and the
+      # service falls asleep after 15 minutes idle, so the first render after a quiet spell takes
+      # 30-60 extra seconds to wake up. Neither matters much for occasional, manually-triggered
+      # renders — revisit this once render volume actually picks up.
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: RENDER_SECRET
+        sync: false
+      - key: SITE_URL
+        value: https://www.binder.co.in/
+      - key: PDF_BUCKET
+        value: rendered-pdfs
