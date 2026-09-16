@@ -1,4 +1,4 @@
-	{
+{
   "name": "binder-render-service",
   "version": "1.0.0",
   "description": "Server-side PDF rendering worker for Binder. Drives the live site's own, already-correct rendering code via a real headless Chrome instance, so an order's print PDF can be generated reliably in the background instead of depending on an admin's browser tab staying open.",
