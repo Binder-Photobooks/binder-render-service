@@ -9,6 +9,7 @@
 
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
 const { renderOrder } = require('./render-worker');
 
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'RENDER_SECRET'];
@@ -20,6 +21,16 @@ if (missing.length) {
 }
 
 const app = express();
+// Without this, the browser blocks the request before it even reaches this server — Admin →
+// PDF Manager lives on binder.co.in, this service lives on a different domain, and browsers
+// refuse cross-origin requests by default unless the server explicitly allows them. This is
+// exactly what produces a generic "could not reach the server" error on the site's side, even
+// though the service itself is running fine — the request never actually leaves the browser.
+app.use(cors({
+  origin: ['https://www.binder.co.in', 'https://binder.co.in'],
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(express.json({ limit: '2mb' }));
 
 function checkAuth(req, res, next) {
