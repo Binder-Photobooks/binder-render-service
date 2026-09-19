@@ -6,8 +6,11 @@
 // same JS function (`window.renderOrderHeadless`) the site's own "Render" button in Admin →
 // PDF Manager already uses. The heavy lifting — page layout, image placement, DPI math, fonts —
 // all happens inside that one shared function on the site itself. This file's job is just:
-// fetch → drive a browser → collect the result → upload it → record what happened.
+// fetch → drive a browser → collect the finished file → upload it → record what happened.
 
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const puppeteer = require('puppeteer');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -39,6 +42,11 @@ async function renderOrder(orderId, fileKey) {
   await supabase.from('orders').update({ render_status: 'rendering', render_error: null }).eq('id', orderId);
 
   let browser;
+  // A dedicated, unique temp folder per render — Chrome's download mechanism needs somewhere
+  // real on disk to write the finished file to; cleaned up in the `finally` block below either
+  // way, success or failure.
+  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'binder-render-'));
+
   try {
     // 2. Launch headless Chrome. --no-sandbox is required on almost every container host
     //    (Render, Railway, Fly.io, Docker generally) since the sandbox needs kernel privileges
@@ -61,14 +69,44 @@ async function renderOrder(orderId, fileKey) {
     page.on('pageerror', (err) => console.error(`[render] page error for ${orderId}:`, err.message));
     page.on('console', (msg) => { if (msg.type() === 'error') console.error(`[render] console.error:`, msg.text()); });
 
-    // 3. Load the live site and wait for it to finish initializing — specifically, for the
+    // 3. Point downloads at our temp folder, using Chrome DevTools Protocol directly — this
+    //    is how the finished PDF actually gets out of the browser. The earlier version of
+    //    this file had window.renderOrderHeadless() RETURN the PDF as a base64 string through
+    //    page.evaluate(), but that channel has a hard ~100MB limit (confirmed against
+    //    Puppeteer's own issue tracker) — a full-resolution, many-page, high-photo-count book
+    //    blows past that easily and silently fails, which is exactly what was producing blank
+    //    PDFs for real orders while small test ones worked fine. A real browser download has
+    //    no such size ceiling. Uses a BROWSER-level CDP session with Browser.setDownloadBehavior
+    //    / Browser.downloadProgress specifically — the page-level Page.setDownloadBehavior /
+    //    Page.downloadProgress equivalents are marked deprecated in Chrome's own DevTools
+    //    Protocol documentation in favour of these.
+    const client = await browser.target().createCDPSession();
+    await client.send('Browser.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: downloadDir,
+      eventsEnabled: true, // required for downloadProgress events to actually fire
+    });
+
+    // Resolves once Chrome reports the download as fully written to disk — driven by the
+    // browser's own event, not by polling the filesystem and guessing when a file has
+    // finished growing.
+    const downloadComplete = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Download did not complete within 3 minutes — possibly a very large book, or the render itself hung')), 180000);
+      client.on('Browser.downloadProgress', (event) => {
+        if (event.state === 'completed') { clearTimeout(timeout); resolve(); }
+        else if (event.state === 'canceled') { clearTimeout(timeout); reject(new Error('Download was canceled by the browser')); }
+      });
+    });
+
+    // 4. Load the live site and wait for it to finish initializing — specifically, for the
     //    headless entry point the site exposes on window to actually exist.
     await page.goto(SITE_URL, { waitUntil: 'networkidle0', timeout: 60000 });
     await page.waitForFunction('typeof window.renderOrderHeadless === "function"', { timeout: 30000 });
 
-    // 4. Call the site's own rendering function directly, passing the already-fetched order in
+    // 5. Call the site's own rendering function directly, passing the already-fetched order in
     //    as a plain JS argument — the page itself never needs to query Supabase or hold any
-    //    credentials at all.
+    //    credentials at all. It triggers a real download rather than returning the PDF data;
+    //    this call's own return value is now just a small, safe {ok, error?} status.
     const result = await page.evaluate(
       (orderData, key) => window.renderOrderHeadless(orderData, key),
       order,
@@ -79,11 +117,18 @@ async function renderOrder(orderId, fileKey) {
       throw new Error(`In-browser render failed: ${(result && result.error) || 'unknown error'}`);
     }
 
-    // 5. Decode the returned PDF (a data URI) and upload it to Storage.
-    const base64 = result.dataUri.split(',')[1];
-    const pdfBuffer = Buffer.from(base64, 'base64');
-    const storagePath = `${orderId}/${fileKey}.pdf`;
+    // 6. Wait for the download itself to finish, then read the actual file bytes off disk —
+    //    Chrome may save it under an internal download GUID rather than the suggested
+    //    filename depending on version, so read whatever landed in the folder rather than
+    //    assuming an exact name.
+    await downloadComplete;
+    const filesInDir = fs.readdirSync(downloadDir).filter((f) => !f.endsWith('.crdownload'));
+    if (!filesInDir.length) throw new Error('Download reported complete, but no file was found in the download folder');
+    const pdfBuffer = fs.readFileSync(path.join(downloadDir, filesInDir[0]));
+    console.log(`[render] downloaded ${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB for ${orderId}/${fileKey}`);
 
+    // 7. Upload those bytes straight to Storage.
+    const storagePath = `${orderId}/${fileKey}.pdf`;
     const { error: uploadErr } = await supabase.storage
       .from(PDF_BUCKET)
       .upload(storagePath, pdfBuffer, { contentType: 'application/pdf', upsert: true });
@@ -91,7 +136,7 @@ async function renderOrder(orderId, fileKey) {
 
     const { data: urlData } = supabase.storage.from(PDF_BUCKET).getPublicUrl(storagePath);
 
-    // 6. Record the result on the order itself, same shape the site's own admin panel expects.
+    // 8. Record the result on the order itself, same shape the site's own admin panel expects.
     const pdfFiles = { ...(order.pdf_files || {}), [fileKey]: urlData.publicUrl };
     await supabase.from('orders').update({
       pdf_files: pdfFiles,
@@ -109,6 +154,7 @@ async function renderOrder(orderId, fileKey) {
     throw err;
   } finally {
     if (browser) await browser.close();
+    fs.rmSync(downloadDir, { recursive: true, force: true });
   }
 }
 
